@@ -2,7 +2,9 @@ package main
 
 import (
 	"log"
+	"math"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -10,6 +12,10 @@ import (
 
 	"github.com/rwcarlsen/goexif/exif"
 	"github.com/rwcarlsen/goexif/mknote"
+)
+
+const (
+	MaxTimeDiffMinutes = 20
 )
 
 // GPSInfo gps info of a photo
@@ -66,8 +72,12 @@ func main() {
 	log.Printf("found %d gps tagged photos, and %d without gps tag", len(photoWithGPS), len(photoWithoutGPS))
 	log.Printf("match non-gps photos to gps-photos")
 	for _, photo := range photoWithoutGPS {
-		nearest := findNearestPhoto(photoWithGPS, photo)
-		log.Printf("found nearest match for %s is %s", photo.Path, nearest.Path)
+		nearest, diff := findNearestPhoto(photoWithGPS, photo)
+		log.Printf("found nearest match for %s is %s, time diff: %s", photo.Path, nearest.Path, diff.String())
+		if diff.Minutes() > MaxTimeDiffMinutes {
+			log.Printf("time difference to nearest photo is too big, skip this one")
+			continue
+		}
 		copyGPSData(nearest, photo)
 	}
 }
@@ -109,6 +119,13 @@ func scanPhotosInPath(folder string) (photoWithGPS, photoWithoutGPS PhotoList) {
 
 func readPhotoFile(path string) (result PhotoDateGPS, hasGPS bool, err error) {
 	f, err := os.Open(path)
+	defer func() {
+		err := f.Close()
+		if err != nil {
+			log.Printf("failed to close file: %v", err)
+		}
+	}()
+
 	if err != nil {
 		log.Printf("failed to read the photo file, error: %v", err)
 		return
@@ -127,6 +144,7 @@ func readPhotoFile(path string) (result PhotoDateGPS, hasGPS bool, err error) {
 	result.DateTime = tm
 
 	lat, long, gpsErr := x.LatLong()
+	log.Printf("%f, %f", lat, long)
 	if gpsErr != nil {
 		log.Printf("could not get GPS data from this photo, err: %v", gpsErr)
 		hasGPS = false
@@ -137,22 +155,45 @@ func readPhotoFile(path string) (result PhotoDateGPS, hasGPS bool, err error) {
 	return
 }
 
-func findNearestPhoto(sortedPhoto PhotoList, photo PhotoDateGPS) PhotoDateGPS {
+func findNearestPhoto(sortedPhoto PhotoList, photo PhotoDateGPS) (PhotoDateGPS, time.Duration) {
 	length := len(sortedPhoto)
 	index := sort.Search(length, func(i int) bool {
 		return sortedPhoto[i].DateTime.After(photo.DateTime) || sortedPhoto[i].DateTime.Equal(photo.DateTime)
 	})
 
-	if index < length && index == 0 {
-		return sortedPhoto[index]
-	} else if index < length {
-		return sortedPhoto[index-1]
+	leftDuration := time.Duration(math.MaxInt64)
+	rightDuration := time.Duration(math.MaxInt64)
+	var left, right PhotoDateGPS
+
+	if index < length {
+		right = sortedPhoto[index]
+		rightDuration = right.DateTime.Sub(photo.DateTime)
+		if index > 0 {
+			left = sortedPhoto[index-1]
+			leftDuration = photo.DateTime.Sub(left.DateTime)
+		}
 	} else {
-		return sortedPhoto[length-1]
+		leftDuration = photo.DateTime.Sub(sortedPhoto[length-1].DateTime)
 	}
 
+	if leftDuration < rightDuration {
+		return left, leftDuration
+	}
+	return right, rightDuration
 }
 
 func copyGPSData(from, to PhotoDateGPS) error {
-	return nil
+	log.Printf("copy gps data from nearest photo")
+	cmd := exec.Command("exiftool", "-tagsfromfile", from.Path,
+		"-GPSLatitude", "-GPSLongitude", "-GPSLongitudeRef", "-GPSLatitudeRef", to.Path)
+
+	err := cmd.Run()
+	if err != nil {
+		out, err := cmd.Output()
+		if err != nil {
+			log.Printf("cmd failed: %v", err)
+		}
+		log.Printf("failed to run exiftool to copy gps data: %s", out)
+	}
+	return err
 }
